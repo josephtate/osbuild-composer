@@ -21,9 +21,9 @@ import (
 
 	"github.com/osbuild/images/pkg/arch"
 	"github.com/osbuild/images/pkg/dnfjson"
+	"github.com/osbuild/images/pkg/upload/azure"
+	"github.com/osbuild/images/pkg/upload/koji"
 	"github.com/osbuild/osbuild-composer/internal/cloud/awscloud"
-	"github.com/osbuild/osbuild-composer/internal/upload/azure"
-	"github.com/osbuild/osbuild-composer/internal/upload/koji"
 	"github.com/osbuild/osbuild-composer/internal/upload/oci"
 	"github.com/osbuild/osbuild-composer/internal/worker"
 )
@@ -190,11 +190,13 @@ var run = func() {
 	}
 
 	logrus.Info("Composer configuration:")
-	encoder := toml.NewEncoder(logrus.StandardLogger().WriterLevel(logrus.InfoLevel))
+	configWriter := logrus.StandardLogger().WriterLevel(logrus.DebugLevel)
+	encoder := toml.NewEncoder(configWriter)
 	err = encoder.Encode(&config)
 	if err != nil {
 		logrus.Fatalf("Could not print config: %v", err)
 	}
+	configWriter.Close()
 
 	if config.DeploymentChannel != "" {
 		logrus.AddHook(&slogger.EnvironmentHook{Channel: config.DeploymentChannel})

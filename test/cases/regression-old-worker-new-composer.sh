@@ -28,10 +28,11 @@ DESIRED_WORKER_RPM="osbuild-composer-worker-$((CURRENT_WORKER_VERSION - 3))"
 # Get the commit hash of the worker version we want to test by comparing the
 # tag for 2 versions back - since the current version might still be unreleased,
 # we subtract 3 from the current version.
+# WARNING - with introduction of a new major version, new `rhel-*-cdn` directory on S3 AWS bucket will be new as well
+# that means it will lack the repositories built from commits tagged with previous versions,
+# so you need to manually copy them there from directories for minor versions on the same S3 AWS bucket.
 DESIRED_TAG_SHA=$(curl -s "https://api.github.com/repos/osbuild/osbuild-composer/git/ref/tags/v$((CURRENT_WORKER_VERSION-3))" | jq -r '.object.sha')
 DESIRED_COMMIT_SHA=$(curl -s "https://api.github.com/repos/osbuild/osbuild-composer/git/tags/$DESIRED_TAG_SHA" | jq -r '.object.sha')
-DESIRED_OSBUILD_COMMIT_SHA=$(curl -s "https://raw.githubusercontent.com/osbuild/osbuild-composer/$DESIRED_COMMIT_SHA/Schutzfile" | jq -r '.["'"${ID}-${VERSION_ID}"'"].dependencies.osbuild.commit')
-
 
 # Get commit hash of latest composer version, only used for verification.
 CURRENT_COMPOSER_VERSION=$(rpm -q --qf '%{version}\n' osbuild-composer)
@@ -77,7 +78,6 @@ EOF
 
 greenprint "Installing osbuild-composer-worker from commit ${DESIRED_COMMIT_SHA}"
 setup_repo osbuild-composer "$DESIRED_COMMIT_SHA" 20
-setup_repo osbuild "$DESIRED_OSBUILD_COMMIT_SHA" 20
 sudo dnf install -y osbuild-composer-worker podman composer-cli
 
 # verify the right worker is installed just to be sure

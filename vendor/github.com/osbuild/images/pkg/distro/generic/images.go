@@ -3,9 +3,9 @@ package generic
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 
 	"github.com/osbuild/images/internal/workload"
-	"github.com/osbuild/images/pkg/arch"
 	"github.com/osbuild/images/pkg/blueprint"
 	"github.com/osbuild/images/pkg/container"
 	"github.com/osbuild/images/pkg/customizations/anaconda"
@@ -15,6 +15,7 @@ import (
 	"github.com/osbuild/images/pkg/customizations/ignition"
 	"github.com/osbuild/images/pkg/customizations/kickstart"
 	"github.com/osbuild/images/pkg/customizations/oscap"
+	"github.com/osbuild/images/pkg/customizations/subscription"
 	"github.com/osbuild/images/pkg/customizations/users"
 	"github.com/osbuild/images/pkg/distro"
 	"github.com/osbuild/images/pkg/image"
@@ -24,13 +25,22 @@ import (
 	"github.com/osbuild/images/pkg/rpmmd"
 )
 
-func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []container.SourceSpec, c *blueprint.Customizations) (manifest.OSCustomizations, error) {
+func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, options distro.ImageOptions, containers []container.SourceSpec, c *blueprint.Customizations) (manifest.OSCustomizations, error) {
 	imageConfig := t.getDefaultImageConfig()
 
 	osc := manifest.OSCustomizations{}
 
 	if t.ImageTypeYAML.Bootable || t.ImageTypeYAML.RPMOSTree {
+		// TODO: for now the only image types that define a default kernel are
+		// ones that use UKIs and don't allow overriding, so this works.
+		// However, if we ever need to specify default kernels for image types
+		// that allow overriding, we will need to change c.GetKernel() to take
+		// an argument as fallback or make it not return the standard "kernel"
+		// when it's unset.
 		osc.KernelName = c.GetKernel().Name
+		if imageConfig.DefaultKernelName != nil {
+			osc.KernelName = *imageConfig.DefaultKernelName
+		}
 
 		var kernelOptions []string
 		// XXX: keep in sync with the identical copy in rhel/images.go
@@ -41,6 +51,9 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 			kernelOptions = append(kernelOptions, bpKernel.Append)
 		}
 		osc.KernelOptionsAppend = kernelOptions
+		if imageConfig.KernelOptionsBootloader != nil {
+			osc.KernelOptionsBootloader = *imageConfig.KernelOptionsBootloader
+		}
 	}
 
 	osc.FIPS = c.GetFIPS()
@@ -76,6 +89,7 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 		osc.DefaultTarget = *imageConfig.DefaultTarget
 	}
 
+	osc.Firewall = imageConfig.Firewall
 	if fw := c.GetFirewall(); fw != nil {
 		options := osbuild.FirewallStageOptions{
 			Ports: fw.Ports,
@@ -84,6 +98,14 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 		if fw.Services != nil {
 			options.EnabledServices = fw.Services.Enabled
 			options.DisabledServices = fw.Services.Disabled
+		}
+		if fw.Zones != nil {
+			for _, z := range fw.Zones {
+				options.Zones = append(options.Zones, osbuild.FirewallZone{
+					Name:    *z.Name,
+					Sources: z.Sources,
+				})
+			}
 		}
 		osc.Firewall = &options
 	}
@@ -98,6 +120,9 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 		osc.Keyboard = keyboard
 	} else if imageConfig.Keyboard != nil {
 		osc.Keyboard = &imageConfig.Keyboard.Keymap
+		if imageConfig.Keyboard.X11Keymap != nil {
+			osc.X11KeymapLayouts = imageConfig.Keyboard.X11Keymap.Layouts
+		}
 	}
 
 	if hostname := c.GetHostname(); hostname != nil {
@@ -129,9 +154,15 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 		osc.ChronyConfig = imageConfig.TimeSynchronization
 	}
 
-	// Relabel the tree, unless the `NoSElinux` flag is explicitly set to `true`
-	if imageConfig.NoSElinux == nil || imageConfig.NoSElinux != nil && !*imageConfig.NoSElinux {
-		osc.SElinux = "targeted"
+	// Relabel the tree, unless the `NoSELinux` flag is explicitly set to `true`
+	if imageConfig.NoSELinux == nil || imageConfig.NoSELinux != nil && !*imageConfig.NoSELinux {
+		osc.SELinux = "targeted"
+		osc.SELinuxForceRelabel = imageConfig.SELinuxForceRelabel
+	}
+
+	// XXX: move into pure YAML
+	if strings.HasPrefix(t.Arch().Distro().Name(), "rhel-") && options.Facts != nil {
+		osc.RHSMFacts = options.Facts
 	}
 
 	var err error
@@ -161,6 +192,9 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 	if containerStorage := c.GetContainerStorage(); containerStorage != nil {
 		osc.ContainersStorage = containerStorage.StoragePath
 	}
+	// set yum repos first, so it doesn't get overridden by
+	// imageConfig.YUMRepos
+	osc.YUMRepos = imageConfig.YUMRepos
 
 	customRepos, err := c.GetRepositories()
 	if err != nil {
@@ -206,8 +240,24 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 		osc.OpenSCAPRemediationConfig = remediationConfig
 	}
 
-	osc.ShellInit = imageConfig.ShellInit
+	var subscriptionStatus subscription.RHSMStatus
+	if options.Subscription != nil {
+		subscriptionStatus = subscription.RHSMConfigWithSubscription
+		if options.Subscription.Proxy != "" {
+			osc.InsightsClientConfig = &osbuild.InsightsClientConfigStageOptions{Config: osbuild.InsightsClientConfig{Proxy: options.Subscription.Proxy}}
+		}
+	} else {
+		subscriptionStatus = subscription.RHSMConfigNoSubscription
+	}
+	if rhsmConfig, exists := imageConfig.RHSMConfig[subscriptionStatus]; exists {
+		osc.RHSMConfig = rhsmConfig
+	}
 
+	if bpRhsmConfig := subscription.RHSMConfigFromBP(c.GetRHSM()); bpRhsmConfig != nil {
+		osc.RHSMConfig = osc.RHSMConfig.Update(bpRhsmConfig)
+	}
+
+	osc.ShellInit = imageConfig.ShellInit
 	osc.Grub2Config = imageConfig.Grub2Config
 	osc.Sysconfig = imageConfig.SysconfigStageOptions()
 	osc.SystemdLogind = imageConfig.SystemdLogind
@@ -223,14 +273,28 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 	osc.PamLimitsConf = imageConfig.PamLimitsConf
 	osc.Sysctld = imageConfig.Sysctld
 	osc.DNFConfig = imageConfig.DNFConfigOptions(t.arch.distro.OsVersion())
+	osc.DNFAutomaticConfig = imageConfig.DNFAutomaticConfig
+	osc.YUMConfig = imageConfig.YumConfig
 	osc.SshdConfig = imageConfig.SshdConfig
 	osc.AuthConfig = imageConfig.Authconfig
 	osc.PwQuality = imageConfig.PwQuality
-	osc.WSLConfig = imageConfig.WSLConfStageOptions()
+	osc.Subscription = options.Subscription
+	osc.WAAgentConfig = imageConfig.WAAgentConfig
+	osc.UdevRules = imageConfig.UdevRules
+	osc.GCPGuestAgentConfig = imageConfig.GCPGuestAgentConfig
 	osc.NetworkManager = imageConfig.NetworkManager
+
+	if imageConfig.WSL != nil {
+		osc.WSLConfig = osbuild.NewWSLConfStageOptions(imageConfig.WSL.Config)
+		osc.WSLDistributionConfig = osbuild.NewWSLDistributionConfStageOptions(imageConfig.WSL.DistributionConfig)
+	}
 
 	osc.Files = append(osc.Files, imageConfig.Files...)
 	osc.Directories = append(osc.Directories, imageConfig.Directories...)
+
+	if imageConfig.NoBLS != nil {
+		osc.NoBLS = *imageConfig.NoBLS
+	}
 
 	ca, err := c.GetCACerts()
 	if err != nil {
@@ -240,6 +304,10 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 		osc.CACerts = ca.PEMCerts
 	}
 
+	if imageConfig.InstallWeakDeps != nil {
+		osc.InstallWeakDeps = *imageConfig.InstallWeakDeps
+	}
+
 	if imageConfig.MachineIdUninitialized != nil {
 		osc.MachineIdUninitialized = *imageConfig.MachineIdUninitialized
 	}
@@ -247,6 +315,8 @@ func osCustomizations(t *imageType, osPackageSet rpmmd.PackageSet, containers []
 	if imageConfig.MountUnits != nil {
 		osc.MountUnits = *imageConfig.MountUnits
 	}
+
+	osc.VersionlockPackages = imageConfig.VersionlockPackages
 
 	return osc, nil
 }
@@ -338,7 +408,7 @@ func diskImage(workload workload.Workload,
 	img.Platform = t.platform
 
 	var err error
-	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], containers, bp.Customizations)
+	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], options, containers, bp.Customizations)
 	if err != nil {
 		return nil, err
 	}
@@ -359,6 +429,18 @@ func diskImage(workload workload.Workload,
 
 	img.Filename = t.Filename()
 
+	img.VPCForceSize = t.ImageTypeYAML.DiskImageVPCForceSize
+
+	if img.OSCustomizations.NoBLS {
+		img.OSProduct = t.Arch().Distro().Product()
+		img.OSVersion = t.Arch().Distro().OsVersion()
+		img.OSNick = t.Arch().Distro().Codename()
+	}
+
+	if t.ImageTypeYAML.DiskImagePartTool != nil {
+		img.PartTool = *t.ImageTypeYAML.DiskImagePartTool
+	}
+
 	return img, nil
 }
 
@@ -374,13 +456,17 @@ func tarImage(workload workload.Workload,
 	img.Platform = t.platform
 
 	var err error
-	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], containers, bp.Customizations)
+	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], options, containers, bp.Customizations)
 	if err != nil {
 		return nil, err
 	}
 
+	d := t.arch.distro
+
 	img.Environment = &t.ImageTypeYAML.Environment
 	img.Workload = workload
+	img.Compression = t.ImageTypeYAML.Compression
+	img.OSVersion = d.OsVersion()
 
 	img.Filename = t.Filename()
 
@@ -399,7 +485,7 @@ func containerImage(workload workload.Workload,
 	img.Platform = t.platform
 
 	var err error
-	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], containers, bp.Customizations)
+	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], options, containers, bp.Customizations)
 	if err != nil {
 		return nil, err
 	}
@@ -431,7 +517,7 @@ func liveInstallerImage(workload workload.Workload,
 	img.Product = d.Product()
 	img.Variant = "Workstation"
 	img.OSVersion = d.OsVersion()
-	img.Release = fmt.Sprintf("%s %s", d.DistroYAML.Product, d.OsVersion())
+	img.Release = fmt.Sprintf("%s %s", d.Product(), d.OsVersion())
 	img.Preview = d.DistroYAML.Preview
 
 	var err error
@@ -442,13 +528,14 @@ func liveInstallerImage(workload workload.Workload,
 
 	img.Filename = t.Filename()
 
-	// Enable grub2 BIOS iso on x86_64 only
-	if img.Platform.GetArch() == arch.ARCH_X86_64 {
-		img.ISOBoot = manifest.Grub2ISOBoot
-	}
-
 	if locale := t.getDefaultImageConfig().Locale; locale != nil {
 		img.Locale = *locale
+	}
+	if isoroot := t.getDefaultImageConfig().ISORootfsType; isoroot != nil {
+		img.RootfsType = *isoroot
+	}
+	if isoboot := t.getDefaultImageConfig().ISOBootType; isoboot != nil {
+		img.ISOBoot = *isoboot
 	}
 
 	installerConfig, err := t.getDefaultInstallerConfig()
@@ -461,11 +548,6 @@ func liveInstallerImage(workload workload.Workload,
 		if installerConfig.SquashfsRootfs != nil && *installerConfig.SquashfsRootfs {
 			img.RootfsType = manifest.SquashfsRootfs
 		}
-	}
-
-	imgConfig := t.getDefaultImageConfig()
-	if imgConfig != nil && imgConfig.IsoRootfsType != nil {
-		img.RootfsType = *imgConfig.IsoRootfsType
 	}
 
 	return img, nil
@@ -484,7 +566,7 @@ func imageInstallerImage(workload workload.Workload,
 	img := image.NewAnacondaTarInstaller()
 
 	var err error
-	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], containers, bp.Customizations)
+	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], options, containers, bp.Customizations)
 	if err != nil {
 		return nil, err
 	}
@@ -496,16 +578,6 @@ func imageInstallerImage(workload workload.Workload,
 	img.Kickstart.Language = &img.OSCustomizations.Language
 	img.Kickstart.Keyboard = img.OSCustomizations.Keyboard
 	img.Kickstart.Timezone = &img.OSCustomizations.Timezone
-
-	if img.Kickstart.Unattended {
-		// NOTE: this is not supported right now because the
-		// image-installer on Fedora isn't working when unattended.
-		// These options are probably necessary but could change.
-		// Unattended/non-interactive installations are better set to text
-		// time since they might be running headless and a UI is
-		// unnecessary.
-		img.AdditionalKernelOpts = []string{"inst.text", "inst.noninteractive"}
-	}
 
 	instCust, err := customizations.GetInstaller()
 	if err != nil {
@@ -533,14 +605,26 @@ func imageInstallerImage(workload workload.Workload,
 		if installerConfig.SquashfsRootfs != nil && *installerConfig.SquashfsRootfs {
 			img.RootfsType = manifest.SquashfsRootfs
 		}
+		if img.Kickstart.Unattended {
+			img.AdditionalKernelOpts = append(img.AdditionalKernelOpts, installerConfig.KickstartUnattendedExtraKernelOpts...)
+		}
+
+		// Put the kickstart file in the root of the iso, some image
+		// types (like rhel10/image-installer) put them there, some
+		// others (like fedora/image-installer) do not and because
+		// its not uniform we need to make it configurable.
+		// XXX: unify with rhel-11 ? or rhel-10.x?
+		if installerConfig.ISORootKickstart != nil {
+			img.ISORootKickstart = *installerConfig.ISORootKickstart
+		}
 	}
 
 	d := t.arch.distro
 
-	img.Product = d.DistroYAML.Product
+	img.Product = d.Product()
 
 	img.OSVersion = d.OsVersion()
-	img.Release = fmt.Sprintf("%s %s", d.DistroYAML.Product, d.OsVersion())
+	img.Release = fmt.Sprintf("%s %s", d.Product(), d.OsVersion())
 	img.Variant = t.Variant
 	img.Preview = d.DistroYAML.Preview
 
@@ -552,14 +636,11 @@ func imageInstallerImage(workload workload.Workload,
 	img.Filename = t.Filename()
 
 	img.RootfsCompression = "xz" // This also triggers using the bcj filter
-	imgConfig := t.getDefaultImageConfig()
-	if imgConfig != nil && imgConfig.IsoRootfsType != nil {
-		img.RootfsType = *imgConfig.IsoRootfsType
+	if isoroot := t.getDefaultImageConfig().ISORootfsType; isoroot != nil {
+		img.RootfsType = *isoroot
 	}
-
-	// Enable grub2 BIOS iso on x86_64 only
-	if img.Platform.GetArch() == arch.ARCH_X86_64 {
-		img.ISOBoot = manifest.Grub2ISOBoot
+	if isoboot := t.getDefaultImageConfig().ISOBootType; isoboot != nil {
+		img.ISOBoot = *isoboot
 	}
 
 	return img, nil
@@ -581,25 +662,13 @@ func iotCommitImage(workload workload.Workload,
 	img.Platform = t.platform
 
 	var err error
-	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], containers, bp.Customizations)
+	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], options, containers, bp.Customizations)
 	if err != nil {
 		return nil, err
 	}
-
-	// see https://github.com/ostreedev/ostree/issues/2840
-	img.OSCustomizations.Presets = []osbuild.Preset{
-		{
-			Name:  "ignition-firstboot-complete.service",
-			State: osbuild.StateEnable,
-		},
-		{
-			Name:  "coreos-ignition-write-issues.service",
-			State: osbuild.StateEnable,
-		},
-		{
-			Name:  "fdo-client-linuxapp.service",
-			State: osbuild.StateEnable,
-		},
+	imgConfig := t.getDefaultImageConfig()
+	if imgConfig != nil {
+		img.OSCustomizations.Presets = imgConfig.Presets
 	}
 
 	img.Environment = &t.ImageTypeYAML.Environment
@@ -628,7 +697,7 @@ func bootableContainerImage(workload workload.Workload,
 	img.Platform = t.platform
 
 	var err error
-	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], containers, bp.Customizations)
+	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], options, containers, bp.Customizations)
 	if err != nil {
 		return nil, err
 	}
@@ -666,25 +735,14 @@ func iotContainerImage(workload workload.Workload,
 	img.Platform = t.platform
 
 	var err error
-	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], containers, bp.Customizations)
+	img.OSCustomizations, err = osCustomizations(t, packageSets[osPkgsKey], options, containers, bp.Customizations)
 	if err != nil {
 		return nil, err
 	}
 
-	// see https://github.com/ostreedev/ostree/issues/2840
-	img.OSCustomizations.Presets = []osbuild.Preset{
-		{
-			Name:  "ignition-firstboot-complete.service",
-			State: osbuild.StateEnable,
-		},
-		{
-			Name:  "coreos-ignition-write-issues.service",
-			State: osbuild.StateEnable,
-		},
-		{
-			Name:  "fdo-client-linuxapp.service",
-			State: osbuild.StateEnable,
-		},
+	imgConfig := t.getDefaultImageConfig()
+	if imgConfig != nil {
+		img.OSCustomizations.Presets = imgConfig.Presets
 	}
 
 	img.ContainerLanguage = img.OSCustomizations.Language
@@ -743,12 +801,6 @@ func iotInstallerImage(workload workload.Workload,
 		img.DisabledAnacondaModules = append(img.DisabledAnacondaModules, instCust.Modules.Disable...)
 	}
 
-	img.AdditionalAnacondaModules = append(img.AdditionalAnacondaModules, []string{
-		anaconda.ModuleTimezone,
-		anaconda.ModuleLocalization,
-		anaconda.ModuleUsers,
-	}...)
-
 	installerConfig, err := t.getDefaultInstallerConfig()
 	if err != nil {
 		return nil, err
@@ -757,6 +809,7 @@ func iotInstallerImage(workload workload.Workload,
 	if installerConfig != nil {
 		img.AdditionalDracutModules = append(img.AdditionalDracutModules, installerConfig.AdditionalDracutModules...)
 		img.AdditionalDrivers = append(img.AdditionalDrivers, installerConfig.AdditionalDrivers...)
+		img.AdditionalAnacondaModules = append(img.AdditionalAnacondaModules, installerConfig.AdditionalAnacondaModules...)
 		if installerConfig.SquashfsRootfs != nil && *installerConfig.SquashfsRootfs {
 			img.RootfsType = manifest.SquashfsRootfs
 		}
@@ -765,10 +818,10 @@ func iotInstallerImage(workload workload.Workload,
 	// On Fedora anaconda needs dbus-broker, but isn't added when dracut runs.
 	img.AdditionalDracutModules = append(img.AdditionalDracutModules, "dbus-broker")
 
-	img.Product = d.DistroYAML.Product
+	img.Product = d.Product()
 	img.Variant = "IoT"
 	img.OSVersion = d.OsVersion()
-	img.Release = fmt.Sprintf("%s %s", d.DistroYAML.Product, d.OsVersion())
+	img.Release = fmt.Sprintf("%s %s", d.Product(), d.OsVersion())
 	img.Preview = d.DistroYAML.Preview
 
 	img.ISOLabel, err = t.ISOLabel()
@@ -779,18 +832,14 @@ func iotInstallerImage(workload workload.Workload,
 	img.Filename = t.Filename()
 
 	img.RootfsCompression = "xz" // This also triggers using the bcj filter
-	imgConfig := t.getDefaultImageConfig()
-	if imgConfig != nil && imgConfig.IsoRootfsType != nil {
-		img.RootfsType = *imgConfig.IsoRootfsType
-	}
-
-	// Enable grub2 BIOS iso on x86_64 only
-	if img.Platform.GetArch() == arch.ARCH_X86_64 {
-		img.ISOBoot = manifest.Grub2ISOBoot
-	}
-
 	if locale := t.getDefaultImageConfig().Locale; locale != nil {
 		img.Locale = *locale
+	}
+	if isoroot := t.getDefaultImageConfig().ISORootfsType; isoroot != nil {
+		img.RootfsType = *isoroot
+	}
+	if isoboot := t.getDefaultImageConfig().ISOBootType; isoboot != nil {
+		img.ISOBoot = *isoboot
 	}
 
 	return img, nil
@@ -907,7 +956,7 @@ func iotSimplifiedInstallerImage(workload workload.Workload,
 	img.AdditionalDracutModules = append(img.AdditionalDracutModules, "dbus-broker")
 
 	d := t.arch.distro
-	img.Product = d.DistroYAML.Product
+	img.Product = d.Product()
 	img.Variant = "IoT"
 	img.OSName = t.OSTree.Name
 	img.OSVersion = d.OsVersion()

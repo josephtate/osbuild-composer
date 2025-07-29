@@ -80,10 +80,12 @@ func main() {
 	}
 
 	logrus.Info("Loaded configuration:")
-	err = DumpConfig(*config, logrus.StandardLogger().WriterLevel(logrus.InfoLevel))
+	dumpWriter := logrus.StandardLogger().WriterLevel(logrus.DebugLevel)
+	err = DumpConfig(*config, dumpWriter)
 	if err != nil {
 		logrus.Fatalf("Error printing configuration: %v", err)
 	}
+	dumpWriter.Close()
 
 	if config.DeploymentChannel != "" {
 		logrus.AddHook(&slogger.EnvironmentHook{Channel: config.DeploymentChannel})
@@ -106,7 +108,7 @@ func main() {
 			panic(err)
 		}
 
-		sentryhook := sentrylogrus.NewFromClient([]logrus.Level{logrus.PanicLevel,
+		sentryhook := sentrylogrus.NewEventHookFromClient([]logrus.Level{logrus.PanicLevel,
 			logrus.FatalLevel, logrus.ErrorLevel},
 			sentry.CurrentHub().Client())
 		logrus.AddHook(sentryhook)

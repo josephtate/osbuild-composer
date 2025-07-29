@@ -189,6 +189,8 @@ func imageTypeFromApiImageType(it ImageTypes, arch distro.Arch) string {
 		return "azure-eap7-rhui"
 	case ImageTypesAzureSapRhui:
 		return "azure-sap-rhui"
+	case ImageTypesAzureSapappsRhui:
+		return "azure-sapapps-rhui"
 	case ImageTypesGuestImage:
 		return "qcow2"
 	case ImageTypesVsphere:
@@ -353,7 +355,7 @@ func (h *apiHandlers) deleteComposeImpl(ctx echo.Context, jobId uuid.UUID) error
 	}
 
 	return ctx.JSON(http.StatusOK, ComposeDeleteStatus{
-		Href: fmt.Sprintf("/api/image-builder-composer/v2/composes/delete/%v", jobId),
+		Href: fmt.Sprintf("/api/image-builder-composer/v2/composes/%v", jobId),
 		Id:   jobId.String(),
 		Kind: "ComposeDeleteStatus",
 	})
@@ -724,7 +726,7 @@ func stagesToPackageMetadata(stages []osbuild.RPMStageMetadata) []PackageMetadat
 					Release:   rpm.Release,
 					Epoch:     rpm.Epoch,
 					Arch:      rpm.Arch,
-					Signature: osbuild.RPMPackageMetadataToSignature(rpm),
+					Signature: rpm.Signature(),
 					Sigmd5:    rpm.SigMD5,
 				},
 			)

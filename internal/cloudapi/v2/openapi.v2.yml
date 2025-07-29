@@ -1215,6 +1215,7 @@ components:
         - azure-cvm
         - azure-eap7-rhui
         - azure-rhui
+        - azure-sapapps-rhui
         - azure-sap-rhui
         - edge-commit
         - edge-container
@@ -2296,6 +2297,10 @@ components:
           type: string
           description: |
             Optional value to register with a template when using rhc to register the system with Insights.
+        patch_url:
+          type: string
+          description: |
+            Optional value used to specify the patch host when registering the system with Insights.
     User:
       type: object
       additionalProperties: false
